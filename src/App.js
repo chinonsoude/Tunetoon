@@ -23,6 +23,8 @@ function App() {
   const [shapeMultiplier, setShapeMultiplier] = useState(1.0);
 
   const mediaRecorderRef = useRef(null);
+  const audioProcessorRef = useRef(null);
+  const audioDataRef = useRef([]);
   const audioContextRef = useRef(null);
   const analyserRef = useRef(null);
   const startTimeRef = useRef(null);
@@ -31,6 +33,8 @@ function App() {
   const audioStorageRef = useRef(new Map());
 
   const streamRef = useRef(null); // store the actual audio stream
+
+  const workletNodeRef = useRef(null);
 
   const captureIntervalRef = useRef(null);
   const [colorSpectrum, setColorSpectrum] = useState("normal");
@@ -102,49 +106,91 @@ function App() {
     requestAnimationFrame(loop);
   }
 
+  // async function startRecording() {
+  //   try {
+  //     Request microphone permission
+  //     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  //     streamRef.current = stream; // keep a reference so we can stop it later
+
+  //     setRecordedChunks([]);
+  //     setAudioData([]);
+
+  //     audioContextRef.current = new (window.AudioContext ||
+  //       window.webkitAudioContext)();
+  //     analyserRef.current = audioContextRef.current.createAnalyser();
+  //     const source = audioContextRef.current.createMediaStreamSource(stream);
+  //     source.connect(analyserRef.current);
+
+  //     analyserRef.current.fftSize = 2048;
+  //     const bufferLength = analyserRef.current.frequencyBinCount;
+  //     const dataArray = new Uint8Array(bufferLength);
+
+  //     // Set up MediaRecorder to record chunks
+  //     mediaRecorderRef.current = null;
+  //     mediaRecorderRef.current = new MediaRecorder(stream);
+  //     mediaRecorderRef.current.ondataavailable = (e) => {
+  //       if (e.data.size > 0) {
+  //         setRecordedChunks((prev) => [...prev, e.data]);
+  //       }
+  //     };
+  //     mediaRecorderRef.current.start(100);
+
+  //     const newIdentifier = generateUniqueIdentifier();
+  //     setCurrentIdentifier(newIdentifier);
+
+  //     setIsRecording(true);
+  //     startTimeRef.current = Date.now();
+  //     timerIntervalRef.current = setInterval(updateTimer, 100);
+
+  //     // Enforce a 3-second minimum before stop is allowed
+  //     // (Implementation detail in the stop button if you want)
+  //   } catch (err) {
+  //     console.error("Error accessing microphone:", err);
+  //     alert("Unable to access microphone. Please check permissions.");
+  //   }
+  // }
   async function startRecording() {
     try {
-      // Request microphone permission
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      streamRef.current = stream; // keep a reference so we can stop it later
+        // Request microphone permission
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        streamRef.current = stream; // Store reference for stopping later
 
-      setRecordedChunks([]);
-      setAudioData([]);
+        // Reset previous recording data
+        setRecordedChunks([]);
+        setAudioData([]);
 
-      audioContextRef.current = new (window.AudioContext ||
-        window.webkitAudioContext)();
-      analyserRef.current = audioContextRef.current.createAnalyser();
-      const source = audioContextRef.current.createMediaStreamSource(stream);
-      source.connect(analyserRef.current);
+        // Create an AudioContext for real-time processing
+        audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)({
+            sampleRate: 44100 // Ensure we are processing at 44.1kHz
+        });
 
-      analyserRef.current.fftSize = 2048;
-      const bufferLength = analyserRef.current.frequencyBinCount;
-      const dataArray = new Uint8Array(bufferLength);
+        // Create an audio processor node for raw PCM capture
+        const source = audioContextRef.current.createMediaStreamSource(stream);
+        const processor = audioContextRef.current.createScriptProcessor(4096, 1, 1);
+        
+        source.connect(processor);
+        processor.connect(audioContextRef.current.destination);
 
-      // Set up MediaRecorder to record chunks
-      mediaRecorderRef.current = null;
-      mediaRecorderRef.current = new MediaRecorder(stream);
-      mediaRecorderRef.current.ondataavailable = (e) => {
-        if (e.data.size > 0) {
-          setRecordedChunks((prev) => [...prev, e.data]);
-        }
-      };
-      mediaRecorderRef.current.start(100);
+        processor.onaudioprocess = (event) => {
+            if (!isRecording) return;
+            const audioData = event.inputBuffer.getChannelData(0); // Get the raw PCM data
+            setAudioData((prevData) => [...prevData, ...audioData]); // Store it in state
+        };
 
-      const newIdentifier = generateUniqueIdentifier();
-      setCurrentIdentifier(newIdentifier);
+        // Store processor reference so we can stop it later
+        audioProcessorRef.current = processor;
 
-      setIsRecording(true);
-      startTimeRef.current = Date.now();
-      timerIntervalRef.current = setInterval(updateTimer, 100);
+        // Mark recording as active
+        setIsRecording(true);
+        startTimeRef.current = Date.now();
+        timerIntervalRef.current = setInterval(updateTimer, 100);
 
-      // Enforce a 3-second minimum before stop is allowed
-      // (Implementation detail in the stop button if you want)
     } catch (err) {
-      console.error("Error accessing microphone:", err);
-      alert("Unable to access microphone. Please check permissions.");
+        console.error("Error accessing microphone:", err);
+        alert("Unable to access microphone. Please check permissions.");
     }
-  }
+}
+
 
   function applyNoiseFloor(audioData, threshold = 15) {
     // threshold in [0..255]
@@ -599,44 +645,101 @@ function App() {
     ctx.fillText(`#${currentIdentifier}`, canvas.width - 70, canvas.height - 10);
   }
 
+  // async function stopRecording() {
+  //   // Optionally enforce minimum 3s
+  //   if (Date.now() - startTimeRef.current < 3000) {
+  //     return;
+  //   }
+
+  //   setIsRecording(false);
+  //   clearInterval(timerIntervalRef.current);
+
+  //   clearInterval(captureIntervalRef.current);
+  //   captureIntervalRef.current = null;
+
+  //   if (
+  //     mediaRecorderRef.current &&
+  //     mediaRecorderRef.current.state !== "inactive"
+  //   ) {
+  //     mediaRecorderRef.current.stop();
+  //     await new Promise((resolve) => {
+  //       mediaRecorderRef.current.onstop = () => {
+  //         const audioBlob = new Blob(recordedChunks, { type: "audio/webm" });
+  //         // store the audio blob in a Map
+  //         audioStorageRef.current.set(currentIdentifier, audioBlob);
+  //         resolve();
+  //       };
+  //     });
+  //   }
+
+  //   // Stop the audio tracks so the mic is actually released
+  //   if (streamRef.current) {
+  //     streamRef.current.getTracks().forEach((track) => track.stop());
+  //     streamRef.current = null; // clear out
+  //   }
+
+  //   if (audioContextRef.current) {
+  //     audioContextRef.current.close();
+  //   }
+  //   generateColorMap();
+  // }
+
   async function stopRecording() {
-    // Optionally enforce minimum 3s
+    if (!isRecording) return;
+
+    // Enforce minimum 3s recording time
     if (Date.now() - startTimeRef.current < 3000) {
-      return;
+        return;
     }
 
     setIsRecording(false);
     clearInterval(timerIntervalRef.current);
 
-    clearInterval(captureIntervalRef.current);
-    captureIntervalRef.current = null;
-
-    if (
-      mediaRecorderRef.current &&
-      mediaRecorderRef.current.state !== "inactive"
-    ) {
-      mediaRecorderRef.current.stop();
-      await new Promise((resolve) => {
-        mediaRecorderRef.current.onstop = () => {
-          const audioBlob = new Blob(recordedChunks, { type: "audio/webm" });
-          // store the audio blob in a Map
-          audioStorageRef.current.set(currentIdentifier, audioBlob);
-          resolve();
-        };
-      });
-    }
-
-    // Stop the audio tracks so the mic is actually released
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((track) => track.stop());
-      streamRef.current = null; // clear out
+    // Stop the processor and audio context
+    if (audioProcessorRef.current) {
+        audioProcessorRef.current.disconnect();
+        audioProcessorRef.current = null;
     }
 
     if (audioContextRef.current) {
-      audioContextRef.current.close();
+        audioContextRef.current.close();
+        audioContextRef.current = null;
     }
-    generateColorMap();
-  }
+
+    // Stop the microphone stream
+    if (streamRef.current) {
+        streamRef.current.getTracks().forEach(track => track.stop());
+        streamRef.current = null;
+    }
+
+    // Convert raw PCM data to Blob (optional)
+    const pcmBlob = new Blob([new Float32Array(audioDataRef.current)], { type: 'audio/wav' });
+    audioStorageRef.current.set(currentIdentifier, pcmBlob);
+
+    generateColorMap(); // Assuming this is used elsewhere in your app
+}
+
+// // Create "Start Recording" button
+// const startButton = document.createElement('button');
+// startButton.id = 'Start Recording';  // Set the ID for the button
+// startButton.textContent = 'Start Recording';  // Set the text of the button
+
+// // Create "Stop Recording" button
+// const stopButton = document.createElement('button');
+// stopButton.id = 'Stop Recording';  // Set the ID for the button
+// stopButton.textContent = 'Stop Recording';  // Set the text of the button
+
+// // Append buttons to the body or a specific container element
+// document.body.appendChild(startButton);
+// document.body.appendChild(stopButton);
+
+// // Add event listeners to the buttons
+// startButton.addEventListener('click', startRecording);
+// stopButton.addEventListener('click', stopRecording);
+
+// // Event listeners for buttons
+// document.getElementById("Start Recording").addEventListener("click", startRecording);
+// document.getElementById("Stop Recording").addEventListener("click", stopRecording);
 
   function downloadImage() {
     if (!canvasRef.current) return;
@@ -897,6 +1000,9 @@ function App() {
                       <i className="bi bi-mic-fill" />
                       <span>Start Recording</span>
                     </button>
+          
+
+
                     {uploadButton}
                   </div>
                 )}
