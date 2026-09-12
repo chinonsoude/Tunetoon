@@ -1,14 +1,120 @@
 // src/App.js
 import React, { useRef, useState, useEffect } from "react";
+import { Routes, Route, useLocation, Link } from 'react-router-dom';
 import "./App.css"; // must include your Tailwind directives
 import { FFmpeg } from '@ffmpeg/ffmpeg';
 import { fetchFile, toBlobURL } from '@ffmpeg/util';
 import FFT from 'fft.js'; // ✅ Correct
+import { initializeApp } from "firebase/app";
+import { getAnalytics } from "firebase/analytics";
+import { getFirestore, doc, getDoc, setDoc, onSnapshot } from 'firebase/firestore';
+import { getStorage, ref, uploadBytes, getDownloadURL } from 'firebase/storage';
+import { getAuth, onAuthStateChanged, signInWithEmailAndPassword, signOut } from "firebase/auth";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyBHOQDsZVqpWbbEsTlbBqdOMtrvYl3Q8yQ",
+  authDomain: "tunetoon-d77f5.firebaseapp.com",
+  projectId: "tunetoon-d77f5",
+  storageBucket: "tunetoon-d77f5.firebasestorage.app",
+  messagingSenderId: "707469378953",
+  appId: "1:707469378953:web:2c85454fa607a491ee4d58",
+  measurementId: "G-65M27VT5N2"
+};
+
+// Initialize Firebase
+const firebaseApp = initializeApp(firebaseConfig);
+const db = getFirestore(firebaseApp);
+const storage = getStorage(firebaseApp);
+const analytics = getAnalytics(firebaseApp);
+const auth = getAuth(firebaseApp);
+function LoginPage() {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+
+  const handleLogin = async () => {
+    try {
+      await signInWithEmailAndPassword(auth, email, password);
+      window.location.href = "/";
+    } catch (err) {
+      console.error(err);
+      setError("Invalid login");
+    }
+  };
+
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-gray-900">
+      <div className="bg-gray-800 p-6 rounded-lg w-full max-w-sm">
+        <h2 className="text-white text-xl mb-4">Login</h2>
+        <input
+          type="email"
+          placeholder="Email"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+          className="w-full mb-3 px-3 py-2 rounded"
+        />
+        <input
+          type="password"
+          placeholder="Password"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          className="w-full mb-3 px-3 py-2 rounded"
+        />
+        {error && <p className="text-red-400 mb-2">{error}</p>}
+        <button
+          onClick={handleLogin}
+          className="w-full bg-blue-500 hover:bg-blue-600 text-white py-2 rounded"
+        >
+          Login
+        </button>
+      </div>
+    </div>
+  );
+}
 
 // For example, choose a chunk (fft) size
 const FFT_SIZE = 2048;
+const HOP_SIZE = 32;  // For the generate HQ audio map
+
+
+function ProtectedRoute({ user, children }) {
+  if (!user) {
+    return <LoginPage />;
+  }
+  return children;
+}
 
 function App() {
+  const [user, setUser] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const unsub = onAuthStateChanged(auth, (u) => {
+      setUser(u);
+      setLoading(false);
+    });
+    return unsub;
+  }, []);
+
+  if (loading) return null;
+
+  return (
+    <Routes>
+      <Route path="/play" element={<PlayPage />} />
+
+      <Route
+        path="/"
+        element={
+          <ProtectedRoute user={user}>
+            <HomePage />
+          </ProtectedRoute>
+        }
+      />
+    </Routes>
+  );
+}
+
+function HomePage() {
   const canvasRef = useRef(null);
   const timerRef = useRef(null);
   const identifierRef = useRef(null);
@@ -21,10 +127,9 @@ function App() {
   const [recordedChunks, setRecordedChunks] = useState([]);
   const [blendMode, setBlendMode] = useState("none");
   const [shapeMultiplier, setShapeMultiplier] = useState(1.0);
+  const [isProcessingHQ, setIsProcessingHQ] = useState(false);
 
   const mediaRecorderRef = useRef(null);
-  const audioProcessorRef = useRef(null);
-  const audioDataRef = useRef([]);
   const audioContextRef = useRef(null);
   const analyserRef = useRef(null);
   const startTimeRef = useRef(null);
@@ -32,12 +137,54 @@ function App() {
 
   const audioStorageRef = useRef(new Map());
 
-  const streamRef = useRef(null); // store the actual audio stream
+  const hqMediaRecorderRef = useRef(null);
+  const hqRecordedChunksRef = useRef([]);
 
-  const workletNodeRef = useRef(null);
+  const streamRef = useRef(null); // store the actual audio stream
 
   const captureIntervalRef = useRef(null);
   const [colorSpectrum, setColorSpectrum] = useState("normal");
+  const [frequencyRangeMode, setFrequencyRangeMode] = useState("voice");
+  const [pixelMosaicMode, setPixelMosaicMode] = useState(false);
+  const [stainedGlassMode, setStainedGlassMode] = useState(false);
+
+  const [isHQRecording, setIsHQRecording] = useState(false);
+  const highQualityDataRef = useRef([]);
+  const recorderNodeRef = useRef(null);
+  const hqAudioContextRef = useRef(null);
+  const hqStreamRef = useRef(null);
+  const [recordingDoc, setRecordingDoc] = useState(null);
+  const { purchased, qrCodeUrl, playUrl, qrToken } = recordingDoc || {};
+
+  const handleLogout = async () => {
+    try {
+      await signOut(auth);
+      window.location.reload();
+    } catch (err) {
+      console.error("Logout error:", err);
+    }
+  };
+
+  function generateLookupToken() {
+    if (window.crypto?.randomUUID) {
+      return window.crypto.randomUUID().replace(/-/g, '');
+    }
+    return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 12)}`;
+  }
+
+  function buildPublicPlayUrl(token) {
+    return `${window.location.origin}/play?token=${encodeURIComponent(token)}`;
+  }
+
+  useEffect(() => {
+    if (!currentIdentifier) return; // Prevents calling doc() with a null ID
+    const unsub = onSnapshot(doc(db, 'recordings', currentIdentifier), (snap) => {
+      if (snap.exists()) {
+        setRecordingDoc(snap.data());
+      }
+    });
+    return () => unsub();
+  }, [currentIdentifier]);
 
   useEffect(() => {
     // Initialize the canvas (fill black)
@@ -90,429 +237,495 @@ function App() {
     }, 1); // 1ms interval
   }
 
-  // Not used
-  function captureFrame() {
-    if (!analyserRef.current) return;
-    const dataArray = new Uint8Array(analyserRef.current.frequencyBinCount);
-
-    const loop = () => {
-      // keep checking isRecording from state or a ref
-      if (!isRecording) return;
-      analyserRef.current.getByteFrequencyData(dataArray);
-      setAudioData((prev) => [...prev, [...dataArray]]);
-      requestAnimationFrame(loop);
-    };
-
-    requestAnimationFrame(loop);
-  }
-
-  // async function startRecording() {
-  //   try {
-  //     Request microphone permission
-  //     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-  //     streamRef.current = stream; // keep a reference so we can stop it later
-
-  //     setRecordedChunks([]);
-  //     setAudioData([]);
-
-  //     audioContextRef.current = new (window.AudioContext ||
-  //       window.webkitAudioContext)();
-  //     analyserRef.current = audioContextRef.current.createAnalyser();
-  //     const source = audioContextRef.current.createMediaStreamSource(stream);
-  //     source.connect(analyserRef.current);
-
-  //     analyserRef.current.fftSize = 2048;
-  //     const bufferLength = analyserRef.current.frequencyBinCount;
-  //     const dataArray = new Uint8Array(bufferLength);
-
-  //     // Set up MediaRecorder to record chunks
-  //     mediaRecorderRef.current = null;
-  //     mediaRecorderRef.current = new MediaRecorder(stream);
-  //     mediaRecorderRef.current.ondataavailable = (e) => {
-  //       if (e.data.size > 0) {
-  //         setRecordedChunks((prev) => [...prev, e.data]);
-  //       }
-  //     };
-  //     mediaRecorderRef.current.start(100);
-
-  //     const newIdentifier = generateUniqueIdentifier();
-  //     setCurrentIdentifier(newIdentifier);
-
-  //     setIsRecording(true);
-  //     startTimeRef.current = Date.now();
-  //     timerIntervalRef.current = setInterval(updateTimer, 100);
-
-  //     // Enforce a 3-second minimum before stop is allowed
-  //     // (Implementation detail in the stop button if you want)
-  //   } catch (err) {
-  //     console.error("Error accessing microphone:", err);
-  //     alert("Unable to access microphone. Please check permissions.");
-  //   }
-  // }
   async function startRecording() {
     try {
-        // Request microphone permission
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        streamRef.current = stream; // Store reference for stopping later
+      // Request microphone permission
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream; // keep a reference so we can stop it later
 
-        // Reset previous recording data
-        setRecordedChunks([]);
-        setAudioData([]);
+      setRecordedChunks([]);
+      setAudioData([]);
 
-        // Create an AudioContext for real-time processing
-        audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)({
-            sampleRate: 44100 // Ensure we are processing at 44.1kHz
-        });
+      audioContextRef.current = new (window.AudioContext ||
+        window.webkitAudioContext)();
+      analyserRef.current = audioContextRef.current.createAnalyser();
+      const source = audioContextRef.current.createMediaStreamSource(stream);
+      source.connect(analyserRef.current);
 
-        // Create an audio processor node for raw PCM capture
-        const source = audioContextRef.current.createMediaStreamSource(stream);
-        const processor = audioContextRef.current.createScriptProcessor(4096, 1, 1);
-        
-        source.connect(processor);
-        processor.connect(audioContextRef.current.destination);
+      analyserRef.current.fftSize = 2048;
+      const bufferLength = analyserRef.current.frequencyBinCount;
+      const dataArray = new Uint8Array(bufferLength);
 
-        processor.onaudioprocess = (event) => {
-            if (!isRecording) return;
-            const audioData = event.inputBuffer.getChannelData(0); // Get the raw PCM data
-            setAudioData((prevData) => [...prevData, ...audioData]); // Store it in state
-        };
+      // Set up MediaRecorder to record chunks
+      mediaRecorderRef.current = null;
+      mediaRecorderRef.current = new MediaRecorder(stream);
+      mediaRecorderRef.current.ondataavailable = (e) => {
+        if (e.data.size > 0) {
+          setRecordedChunks((prev) => [...prev, e.data]);
+        }
+      };
+      mediaRecorderRef.current.start(100);
 
-        // Store processor reference so we can stop it later
-        audioProcessorRef.current = processor;
+      const newIdentifier = generateUniqueIdentifier();
+      setCurrentIdentifier(newIdentifier);
 
-        // Mark recording as active
-        setIsRecording(true);
-        startTimeRef.current = Date.now();
-        timerIntervalRef.current = setInterval(updateTimer, 100);
+      setIsRecording(true);
+      startTimeRef.current = Date.now();
+      timerIntervalRef.current = setInterval(updateTimer, 100);
+
+      // Enforce a 3-second minimum before stop is allowed
+      // (Implementation detail in the stop button if you want)
+    } catch (err) {
+      console.error("Error accessing microphone:", err);
+      alert("Unable to access microphone. Please check permissions.");
+    }
+  }
+
+  async function startHighQualityRecording() {
+    try {
+      // 1) Get user media
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1 }, // or 2 if you want stereo
+      });
+
+      // 2) Create an AudioContext; optionally pass { sampleRate: 44100 }
+      const audioCtx = new AudioContext({ sampleRate: 44100 });
+      hqAudioContextRef.current = audioCtx;
+      hqStreamRef.current = stream;
+
+      hqMediaRecorderRef.current = new MediaRecorder(stream, {
+        mimeType: 'audio/webm; codecs=opus'
+      });
+
+      hqRecordedChunksRef.current = [];
+      hqMediaRecorderRef.current.ondataavailable = (e) => {
+        if (e.data.size > 0) {
+          hqRecordedChunksRef.current.push(e.data);
+        }
+      };
+
+      // Start recording in small chunks (e.g. 100 ms)
+      hqMediaRecorderRef.current.start(100);
+
+      // 3) Resume it (important for iOS/Safari)
+      await audioCtx.resume();
+
+      // 3) Add our AudioWorklet
+      // Adjust the path so it points to your file
+      await audioCtx.audioWorklet.addModule('/recorderWorklet.js');
+
+      // 4) Create an instance of the AudioWorkletNode
+      const recorderNode = new AudioWorkletNode(audioCtx, 'recorder-worklet');
+      recorderNodeRef.current = recorderNode;
+
+      // ** Clear existing data so we start fresh **
+      highQualityDataRef.current = [];
+      setAudioData([]);  // if you want to clear any leftover frames in the UI
+      setCurrentIdentifier(generateUniqueIdentifier());
+
+      // 5) Listen for messages from the processor
+      recorderNode.port.onmessage = (event) => {
+        // event.data is a Float32Array of samples
+        // Append these to our array
+        highQualityDataRef.current.push(...event.data);
+      };
+
+      // 6) Create a MediaStreamAudioSourceNode from the stream
+      const source = audioCtx.createMediaStreamSource(stream);
+
+      // 7) Connect the source -> recorderNode -> destination (optional)
+      source.connect(recorderNode);
+      // If you want to hear it while recording:
+      recorderNode.connect(audioCtx.destination);
+
+      // Clear and set state
+      highQualityDataRef.current = [];
+      setIsHQRecording(true);
 
     } catch (err) {
-        console.error("Error accessing microphone:", err);
-        alert("Unable to access microphone. Please check permissions.");
+      console.error("Error capturing HQ audio:", err);
+      alert("Could not access mic for HQ recording.");
     }
-}
-
-
-  function applyNoiseFloor(audioData, threshold = 15) {
-    // threshold in [0..255]
-    // Return a new array with frames that are "loud enough"
-    return audioData.map(frame => {
-      const maxVal = Math.max(...frame);
-      // If max amplitude in this frame is below threshold, zero it out
-      // or skip it.
-      if (maxVal < threshold) {
-        // Option A: Make the entire frame zero (so it draws black)
-        return frame.map(() => 0);
-
-        // Option B: Return null or an empty array (to skip it entirely)
-        // return null;
-      }
-      return frame;
-    }).filter(Boolean); // remove null frames if you're skipping them
   }
 
   function generateColorMap() {
     if (!canvasRef.current) return;
 
-    // 1) Prepare an offscreen canvas
     const mainCanvas = canvasRef.current;
     const mainCtx = mainCanvas.getContext("2d");
-    const offscreen = document.createElement("canvas");
-    const offCtx = offscreen.getContext("2d");
-    offscreen.width = 512;
-    offscreen.height = 512;
 
-    // Fill black
-    offCtx.fillStyle = "black";
-    offCtx.fillRect(0, 0, offscreen.width, offscreen.height);
+    mainCanvas.width = 512;
+    mainCanvas.height = 512;
 
-    // Standard logic
-    const totalFrames = audioData.length;
-    const pixelsPerSide = Math.ceil(Math.sqrt(totalFrames));
-    const pixelSize = offscreen.width / pixelsPerSide;
+    const width = mainCanvas.width;
+    const height = mainCanvas.height;
 
-    // 1) Collect the dominant bin info (index + amplitude) for each frame
-    const dominantIndices = new Array(totalFrames);
-    const dominantAmps = new Array(totalFrames);
+    // Clear canvas
+    mainCtx.fillStyle = "black";
+    mainCtx.fillRect(0, 0, width, height);
 
-    audioData.forEach((frame, i) => {
-      const domAmp = Math.max(...frame);
-      const domIndex = frame.indexOf(domAmp);
-      dominantIndices[i] = domIndex;
-      dominantAmps[i] = domAmp;
-    });
+    if (!audioData.length) return;
 
-    // 2) Min/max
-    const minBin = Math.min(...dominantIndices);
-    const maxBin = Math.max(...dominantIndices);
-    const binRange = Math.max(1, maxBin - minBin);
+    const sampleRate = audioContextRef.current?.sampleRate || 44100;
+    const fftSize = analyserRef.current?.fftSize || 2048;
+    const binHz = sampleRate / fftSize;
 
-    // 3) Draw squares on the offscreen canvas
-    audioData.forEach((frame, index) => {
-      const domAmp = Math.max(...frame);
-      const domIndex = frame.indexOf(domAmp);
-    
-      let fraction = (domIndex - minBin) / binRange;   // 0..1
-      let alpha = domAmp / 255;
-    
-      if (colorSpectrum === "inverted") {
-        fraction = 1 - fraction;      // flip frequency
-        alpha = 1 - alpha;           // flip amplitude
-      }
-    
-      // Convert fraction to wavelength
-      const wavelength = 380 + fraction * (700 - 380);
-      const [r, g, b] = wavelengthToRGB(wavelength);
-    
-      offCtx.fillStyle = `rgba(${r}, ${g}, ${b}, ${alpha})`;    
+    // Log-spaced bands (voice-oriented)
+    const bandEdges = [80, 160, 320, 640, 1280, 2560, 4000];
 
-      // Position of this cell in the grid:
-      const xBase = (index % pixelsPerSide) * pixelSize;
-      const yBase = Math.floor(index / pixelsPerSide) * pixelSize;
+    let peakEnergy = 1;
 
-      // Don’t mutate shapeMultiplier directly
-      let localShapeMultiplier = shapeMultiplier;
+    const ema = 0.28; // slightly more reactive
 
-      // If in additive mode, override it
-      if (blendMode === "additive") {
-        localShapeMultiplier = 1.5;
-      }
+    let prevHue = 180;
 
-      // Then use localShapeMultiplier for the shape size
-      const shapeSize = pixelSize * localShapeMultiplier;
+    let prevEnergy = 0;
 
-      // We'll center the shape so it overlaps around its cell:
-      const centerOffset = (shapeSize - pixelSize) / 2;
+    // ---- Adaptive Frequency Window (smoothed) ----
+    let adaptiveMinBin = 0;
+    let adaptiveMaxBin = fftSize / 2;
+    const rangeEma = 0.15; // smoothing factor
 
-      // For squares:
-      if (blendMode === "circles") {
-        offCtx.beginPath();
-        offCtx.arc(
-          xBase + pixelSize / 2,
-          yBase + pixelSize / 2,
-          (shapeSize / 2),
-          0,
-          2 * Math.PI
-        );
-        offCtx.fill();
-      } else {
-        // squares (with additive overlap if shapeMultiplier > 1)
-        offCtx.fillRect(
-          xBase - centerOffset,
-          yBase - centerOffset,
-          shapeSize,
-          shapeSize
-        );
-      }
-    });
-
-    // 2) Now copy from offscreen to main canvas with a heavier blur
-    switch (blendMode) {
-      case "none":
-        mainCtx.filter = "none";
-        break;
-      case "light":
-        mainCtx.filter = "blur(128px)";
-        break;
-      case "heavy":
-        mainCtx.filter = "blur(512px)";
-        break;
-      case "additive":
-        mainCtx.globalCompositeOperation = "lighter";
-        mainCtx.filter = "blur(512px)";
-        break;
-      default:
-        mainCtx.filter = "blur(128px)";
+    // ---- Blend Mode Setup ----
+    if (blendMode === "additive") {
+      mainCtx.globalCompositeOperation = "lighter";
+    } else {
+      mainCtx.globalCompositeOperation = "source-over";
     }
-    mainCtx.drawImage(offscreen, 0, 0);
+
+    audioData.forEach((frame, index) => {
+      // ===== SOFTENED STAINED GLASS MODE =====
+      if (stainedGlassMode) {
+        const sampleRate = audioContextRef.current?.sampleRate || 44100;
+        const fftSize = analyserRef.current?.fftSize || 2048;
+        const binHz = sampleRate / fftSize;
+
+        const bandEdges = [80, 160, 320, 640, 1280, 2560, 4000];
+
+        // Compute 6 band energies
+        const bands = new Array(6).fill(0);
+        for (let b = 0; b < 6; b++) {
+          const startBin = Math.floor(bandEdges[b] / binHz);
+          const endBin = Math.floor(bandEdges[b + 1] / binHz);
+          for (let i = startBin; i <= endBin && i < frame.length; i++) {
+            bands[b] += frame[i];
+          }
+        }
+
+        const totalEnergy = bands.reduce((a, b) => a + b, 0);
+        if (totalEnergy < 5) return;
+
+        const sum = bands.reduce((a, b) => a + b, 0) || 1;
+        const norm = bands.map(v => v / sum);
+
+        // Use spectral centroid instead of dominant band
+        let centroid = 0;
+        for (let i = 0; i < 6; i++) centroid += i * norm[i];
+        const centroidNorm = centroid / 5;
+
+        // Moderate grid snap
+        const timeNorm = index / audioData.length;
+        let x = timeNorm * width;
+        const gridSize = 20 * shapeMultiplier;
+        x = Math.round(x / gridSize) * gridSize;
+
+        let y = (1 - centroidNorm) * height;
+        y = Math.round(y / gridSize) * gridSize;
+
+        // Softer quantization
+        const hueSteps = 10;   // more hue variation
+        const slSteps = 5;     // smoother saturation/lightness
+
+        let hue = centroidNorm * 360;
+        hue = Math.round(hue / (360 / hueSteps)) * (360 / hueSteps);
+
+        let saturation = 75;
+        saturation = Math.round(saturation / (100 / slSteps)) * (100 / slSteps);
+
+        let lightness = 45 + (norm[2] * 20);
+        lightness = Math.round(lightness / (100 / slSteps)) * (100 / slSteps);
+
+        const [r, g, b] = hslToRgb(hue, saturation, lightness);
+
+        mainCtx.globalCompositeOperation = "source-over";
+        mainCtx.fillStyle = `rgba(${r}, ${g}, ${b}, 0.95)`;
+
+        const radius = gridSize * 0.6;
+
+        mainCtx.beginPath();
+        mainCtx.arc(x, y, radius, 0, 2 * Math.PI);
+        mainCtx.fill();
+
+        return;
+      }
+
+      // ---- Compute 6-band energies ----
+      const bands = new Array(6).fill(0);
+
+      for (let b = 0; b < 6; b++) {
+        const startBin = Math.floor(bandEdges[b] / binHz);
+        const endBin = Math.floor(bandEdges[b + 1] / binHz);
+
+        for (let i = startBin; i <= endBin && i < frame.length; i++) {
+          bands[b] += frame[i];
+        }
+      }
+
+      const totalEnergy = bands.reduce((a, b) => a + b, 0);
+      peakEnergy = Math.max(peakEnergy, totalEnergy);
+
+      if (totalEnergy < 5) {
+        prevEnergy = totalEnergy;
+        return; // silence gate
+      }
+
+      // ---- Transient detection ----
+      const isTransient = totalEnergy > prevEnergy * 1.45;
+
+      prevEnergy = totalEnergy;
+
+      const sum = bands.reduce((a, b) => a + b, 0) || 1;
+      const norm = bands.map(v => v / sum);
+
+      // ---- Spectral centroid ----
+      let centroid = 0;
+      for (let i = 0; i < 6; i++) {
+        centroid += i * norm[i];
+      }
+      const centroidNorm = centroid / 5;
+
+      // ---- Spectral spread ----
+      let variance = 0;
+      for (let i = 0; i < 6; i++) {
+        variance += norm[i] * Math.pow(i - centroid, 2);
+      }
+      const spread = Math.min(1, variance / 2.5);
+
+      // ---- Energy normalization (log scaled) ----
+      const energyNorm = Math.log1p(totalEnergy) / Math.log1p(peakEnergy);
+
+      // ---- Position ----
+      const timeNorm = index / audioData.length;
+      let x = timeNorm * width;
+
+      // Add slight generative vertical jitter based on spread
+      const jitter = (spread - 0.5) * 20;
+      let y = (1 - centroidNorm) * height + jitter;
+
+      // ---- Pixel Mosaic Snap ----
+      if (pixelMosaicMode) {
+        const gridSize = 16 * shapeMultiplier;
+        x = Math.round(x / gridSize) * gridSize;
+        y = Math.round(y / gridSize) * gridSize;
+      }
+
+      // ---- 6 Band Anchor Points (dynamic harmonic placement) ----
+      for (let b = 0; b < 6; b++) {
+        const bandStrength = norm[b];
+        if (bandStrength < 0.05) continue;
+
+        // Compute weighted bin center inside this band
+        const startBin = Math.floor(bandEdges[b] / binHz);
+        const endBin = Math.floor(bandEdges[b + 1] / binHz);
+
+        let weightedBin = 0;
+        let binTotal = 0;
+
+        for (let i = startBin; i <= endBin && i < frame.length; i++) {
+          weightedBin += i * frame[i];
+          binTotal += frame[i];
+        }
+
+        const binCenter = binTotal ? weightedBin / binTotal : startBin;
+
+        // ---- Frequency Range Mode Switch ----
+        let minBin, maxBin;
+
+        if (frequencyRangeMode === "voice") {
+          minBin = Math.floor(80 / binHz);
+          maxBin = Math.floor(6000 / binHz);
+        } else if (frequencyRangeMode === "music") {
+          minBin = Math.floor(20 / binHz);
+          maxBin = Math.floor(12000 / binHz);
+        } else {
+          // Adaptive mode
+          let activeMin = frame.length;
+          let activeMax = 0;
+          const threshold = 10;
+
+          for (let i = 0; i < frame.length; i++) {
+            if (frame[i] > threshold) {
+              activeMin = Math.min(activeMin, i);
+              activeMax = Math.max(activeMax, i);
+            }
+          }
+
+          if (activeMin >= activeMax) {
+            activeMin = 0;
+            activeMax = frame.length - 1;
+          }
+
+          adaptiveMinBin = adaptiveMinBin + (activeMin - adaptiveMinBin) * rangeEma;
+          adaptiveMaxBin = adaptiveMaxBin + (activeMax - adaptiveMaxBin) * rangeEma;
+
+          minBin = adaptiveMinBin;
+          maxBin = adaptiveMaxBin;
+        }
+
+        const clampedBin = Math.max(minBin, Math.min(maxBin, binCenter));
+        const binNorm = (clampedBin - minBin) / (maxBin - minBin || 1);
+        const bandY = (1 - binNorm) * height;
+
+        // Color each band distinctly across spectrum
+        const bandHue = (b / 5) * 360;
+
+        // ---- Strong Stained Glass Mode (band anchor) ----
+        let bandHueToUse = bandHue;
+        let bandSatToUse = 80;
+        let bandLightToUse = 45;
+
+        if (stainedGlassMode) {
+          const hueSteps = 6;
+          const slSteps = 3;
+
+          bandHueToUse = Math.round(bandHueToUse / (360 / hueSteps)) * (360 / hueSteps);
+          bandSatToUse = Math.round(bandSatToUse / (100 / slSteps)) * (100 / slSteps);
+          bandLightToUse = Math.round(bandLightToUse / (100 / slSteps)) * (100 / slSteps);
+        }
+
+        let [br, bg, bb] = hslToRgb(bandHueToUse, bandSatToUse, bandLightToUse);
+
+        const bandAlpha = bandStrength * 0.6;
+        const bandRadius = 1 + bandStrength * 4;
+
+        mainCtx.fillStyle = `rgba(${br}, ${bg}, ${bb}, ${bandAlpha})`;
+
+        mainCtx.beginPath();
+        mainCtx.arc(x, bandY, bandRadius, 0, 2 * Math.PI);
+        mainCtx.fill();
+      }
+
+      // ---- Expanded Hue Mapping (full 360° palette) ----
+      // Centroid drives primary hue
+      let hueTarget = centroidNorm * 360;
+
+      // Add spread-based hue modulation for more generative variation
+      hueTarget += spread * 90;
+
+      hueTarget = hueTarget % 360;
+
+      prevHue = prevHue + (hueTarget - prevHue) * ema;
+
+      // ---- Richer Saturation ----
+      const saturation = Math.min(100, (0.6 + spread * 0.8) * 100);
+
+      // Cap lightness so color never approaches white
+      const lightness = (0.12 + energyNorm * 0.38) * 100;
+
+      // Properly restore colorSpectrum inversion (hue inversion)
+      if (colorSpectrum === "inverted") {
+        // Invert hue 180 degrees
+        prevHue = (prevHue + 180) % 360;
+      }
+
+      // ---- Strong Stained Glass Mode (centroid) ----
+      let hueToUse = prevHue;
+      let satToUse = saturation;
+      let lightToUse = lightness;
+
+      if (stainedGlassMode) {
+        const hueSteps = 6;       // fewer hues
+        const slSteps = 3;        // very blocky sat/light
+
+        hueToUse = Math.round(hueToUse / (360 / hueSteps)) * (360 / hueSteps);
+        satToUse = Math.round(satToUse / (100 / slSteps)) * (100 / slSteps);
+        lightToUse = Math.round(lightToUse / (100 / slSteps)) * (100 / slSteps);
+      }
+
+      let [r, g, b] = hslToRgb(hueToUse, satToUse, lightToUse);
+
+      // Reduce stacking brightness
+      let alpha = Math.pow(energyNorm, 1.4) * 0.75;
+      if (energyNorm < 0.04) alpha = 0;
+
+      if (colorSpectrum === "inverted") {
+        alpha = 1 - alpha;
+      }
+
+      mainCtx.fillStyle = `rgba(${r}, ${g}, ${b}, ${alpha})`;
+
+      // ---- Energy-driven glow toggle ----
+      if (energyNorm > 0.75) {
+        mainCtx.globalCompositeOperation = "lighter";
+      } else {
+        mainCtx.globalCompositeOperation = "source-over";
+      }
+
+      // Smaller brush to prevent over-bright overlap
+      let baseRadius = 1.5 + energyNorm * 3.5;
+      let radius = baseRadius * shapeMultiplier;
+
+      // ---- Tonal vs Noisy Brush Mode ----
+      const flatnessThreshold = 0.6;
+
+      if (blendMode === "circles") {
+        // ---- Huge Circle Pixel Mode ----
+        const pixelRadius = 8 * shapeMultiplier + energyNorm * 14;
+
+        mainCtx.beginPath();
+        mainCtx.arc(x, y, pixelRadius, 0, 2 * Math.PI);
+        mainCtx.fill();
+
+      } else {
+        if (spread > flatnessThreshold) {
+          // Noisy / consonant → scatter particles
+          const scatterCount = 3;
+          for (let i = 0; i < scatterCount; i++) {
+            const offsetX = (Math.random() - 0.5) * 10;
+            const offsetY = (Math.random() - 0.5) * 10;
+
+            mainCtx.fillRect(
+              x + offsetX - radius * 0.6,
+              y + offsetY - radius * 0.6,
+              radius * 1.2,
+              radius * 1.2
+            );
+          }
+        } else {
+          // Tonal / vowel → smooth square stroke
+          mainCtx.fillRect(x - radius, y - radius, radius * 2, radius * 2);
+        }
+      }
+
+      // ---- Transient Burst ----
+      if (isTransient) {
+        mainCtx.beginPath();
+        mainCtx.arc(x, y, radius * 2.2, 0, 2 * Math.PI);
+        mainCtx.fill();
+      }
+
+      // ---- Manual Bloom (heavy post-processing mode) ----
+      if (blendMode === "heavy") {
+        const originalAlpha = mainCtx.globalAlpha;
+
+        mainCtx.globalAlpha = alpha * 0.25;
+        mainCtx.beginPath();
+        mainCtx.arc(x, y, radius * 3, 0, 2 * Math.PI);
+        mainCtx.fill();
+
+        mainCtx.globalAlpha = originalAlpha;
+      }
+    });
+
+    // Reset filter
     mainCtx.filter = "none";
+
     mainCtx.globalCompositeOperation = "source-over";
 
-    // Draw your ID text
-    mainCtx.font = "12px monospace";
-    mainCtx.fillStyle = "rgba(255, 255, 255, 0.5)";
-    mainCtx.fillText(`#${currentIdentifier}`, mainCanvas.width - 70, mainCanvas.height - 10);
-  }
-
-  function generateColorMapOLD5NoBlur() {
-    if (!canvasRef.current) return;
-    const canvas = canvasRef.current;
-    const ctx = canvas.getContext("2d");
-    const totalFrames = audioData.length;
-    const pixelsPerSide = Math.ceil(Math.sqrt(totalFrames));
-
-    // Fill black background
-    ctx.fillStyle = "black";
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-    const pixelSize = canvas.width / pixelsPerSide;
-    ctx.filter = "blur(2px)";
-
-    // 1) Collect the dominant bin info (index + amplitude) for each frame
-    const dominantIndices = new Array(totalFrames);
-    const dominantAmps = new Array(totalFrames);
-
-    audioData.forEach((frame, i) => {
-      const domAmp = Math.max(...frame);                 // amplitude
-      const domIndex = frame.indexOf(domAmp);            // which bin
-      dominantIndices[i] = domIndex;
-      dominantAmps[i] = domAmp;
-    });
-
-    // 2) Find overall min + max dominant bin index across all frames
-    const minBin = Math.min(...dominantIndices);
-    const maxBin = Math.max(...dominantIndices);
-    // Avoid division-by-zero if minBin == maxBin
-    const binRange = Math.max(1, maxBin - minBin);
-
-    // 3) Second pass: map each frame's dominant bin to visible range 380..700
-    audioData.forEach((frame, index) => {
-      const domIndex = dominantIndices[index];
-      const domAmp = dominantAmps[index];
-
-      // fraction in [0..1] across the min->max range
-      const fraction = (domIndex - minBin) / binRange;
-      // map fraction to wavelength range
-      const wavelength = 380 + fraction * (700 - 380);
-
-      // convert wavelength -> approximate RGB
-      const [r, g, b] = wavelengthToRGB(wavelength);
-
-      // amplitude in [0..255] => alpha in [0..1]
-      const alpha = domAmp / 255;
-
-      // fill the pixel
-      const x = (index % pixelsPerSide) * pixelSize;
-      const y = Math.floor(index / pixelsPerSide) * pixelSize;
-      ctx.fillStyle = `rgba(${r},${g},${b},${alpha})`;
-      ctx.fillRect(x, y, pixelSize, pixelSize);
-    });
-
-    ctx.filter = "none";
-    ctx.font = "12px monospace";
-    ctx.fillStyle = "rgba(255, 255, 255, 0.5)";
-    ctx.fillText(`#${currentIdentifier}`, canvas.width - 70, canvas.height - 10);
-  }
-
-  function generateColorMapOLD4() {
-    if (!canvasRef.current) return;
-    const canvas = canvasRef.current;
-    const ctx = canvas.getContext("2d");
-    const totalFrames = audioData.length;
-    const pixelsPerSide = Math.ceil(Math.sqrt(totalFrames));
-
-    // Fill black background
-    ctx.fillStyle = "black";
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-    const pixelSize = canvas.width / pixelsPerSide;
-    ctx.filter = "blur(2px)";
-
-    audioData.forEach((frame, index) => {
-      // 1) Find the loudest amplitude in this snapshot (the "dominant" bin)
-      const dominantBinAmplitude = Math.max(...frame);
-      const dominantBinIndex = frame.indexOf(dominantBinAmplitude);
-
-      // 2) Map that bin index [0..(frame.length-1)] to a wavelength [380..700 nm]
-      const fraction = dominantBinIndex / (frame.length - 1);
-      const wavelength = 380 + fraction * (700 - 380);
-
-      // 3) Convert that wavelength to an approximate RGB color
-      const [r, g, b] = wavelengthToRGB(wavelength);
-
-      // 4) Use amplitude for alpha (0–255 -> 0.0–1.0)
-      const alpha = dominantBinAmplitude / 255;
-
-      // Fill pixel with RGBA color
-      const x = (index % pixelsPerSide) * pixelSize;
-      const y = Math.floor(index / pixelsPerSide) * pixelSize;
-      ctx.fillStyle = `rgba(${r},${g},${b},${alpha})`;
-      ctx.fillRect(x, y, pixelSize, pixelSize);
-    });
-
-    ctx.filter = "none";
-    ctx.font = "12px monospace";
-    ctx.fillStyle = "rgba(255, 255, 255, 0.5)";
-    ctx.fillText(`#${currentIdentifier}`, canvas.width - 70, canvas.height - 10);
-  }
-
-  function generateColorMapOLD3() {
-    if (!canvasRef.current) return;
-    const canvas = canvasRef.current;
-    const ctx = canvas.getContext("2d");
-    const totalFrames = audioData.length;
-    const pixelsPerSide = Math.ceil(Math.sqrt(totalFrames));
-
-    // Fill black background
-    ctx.fillStyle = "black";
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-    const pixelSize = canvas.width / pixelsPerSide;
-    ctx.filter = "blur(2px)";
-
-    audioData.forEach((frame, index) => {
-      const x = (index % pixelsPerSide) * pixelSize;
-      const y = Math.floor(index / pixelsPerSide) * pixelSize;
-
-      const avgFrequency = frame.reduce((sum, value) => sum + value, 0) / frame.length;
-      const maxVolume = Math.max(...frame);
-
-      // Map avgFrequency: 0..255 -> wavelength: 380..700
-      const wavelength = 380 + (avgFrequency / 255) * (700 - 380);
-      // Convert that to RGB
-      const [r, g, b] = wavelengthToRGB(wavelength);
-
-      // Optionally apply alpha from volume
-      const alpha = maxVolume / 255; // or 1.0 if you prefer fully opaque
-
-      ctx.fillStyle = `rgba(${r},${g},${b},${alpha})`;
-      ctx.fillRect(x, y, pixelSize, pixelSize);
-    });
-
-    // remove blur filter, add ID text
-    ctx.filter = "none";
-    ctx.font = "12px monospace";
-    ctx.fillStyle = "rgba(255, 255, 255, 0.5)";
-    ctx.fillText(`#${currentIdentifier}`, canvas.width - 70, canvas.height - 10);
-  }
-
-  function generateColorMapOLD2() {
-    if (!canvasRef.current) return;
-    const canvas = canvasRef.current;
-    const ctx = canvas.getContext("2d");
-    const totalFrames = audioData.length;
-    const pixelsPerSide = Math.ceil(Math.sqrt(totalFrames));
-
-    // Fill black background
-    ctx.fillStyle = "black";
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-    const pixelSize = canvas.width / pixelsPerSide;
-    ctx.filter = "blur(2px)";
-
-    audioData.forEach((frame, index) => {
-      const x = (index % pixelsPerSide) * pixelSize;
-      const y = Math.floor(index / pixelsPerSide) * pixelSize;
-
-      const avgFrequency = frame.reduce((sum, value) => sum + value, 0) / frame.length;
-      const maxVolume = Math.max(...frame);
-
-      // map avgFrequency => hue, maxVolume => lightness or something
-      const hue = (avgFrequency / 255) * 360;        // 0-360
-      const volumeRatio = maxVolume / 255;          // 0.0 - 1.0
-      const saturation = 80;                        // 80%
-      const lightness = 40 + volumeRatio * 50;      // 40% -> 90%
-
-      const [r, g, b] = hslToRgb(hue, saturation, lightness);
-      const hexColor = rgbToHex(r, g, b);
-
-      ctx.fillStyle = hexColor;
-      ctx.fillRect(x, y, pixelSize, pixelSize);
-    });
-
-    ctx.filter = "none";
-    ctx.font = "12px monospace";
-    ctx.fillStyle = "rgba(255, 255, 255, 0.5)";
-    ctx.fillText(`#${currentIdentifier}`, canvas.width - 70, canvas.height - 10);
+    // Draw identifier
+    // mainCtx.font = "12px monospace";
+    // mainCtx.fillStyle = "rgba(255,255,255,0.5)";
+    // mainCtx.fillText(`#${currentIdentifier}`, width - 70, height - 10);
   }
 
   function hslToRgb(h, s, l) {
@@ -539,241 +752,221 @@ function App() {
     return [r, g, b];
   }
 
-  function rgbToHex(r, g, b) {
-    // r, g, b each in [0..255]
-    const toHex = (val) => val.toString(16).padStart(2, '0');
-    return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
-  }
-
-  function wavelengthToRGB(wavelength) {
-    // Wavelength in [380, 700], approximate
-    // Based on algorithms by Dan Bruton and others.
-
-    let R, G, B;
-    let alpha = 1.0;
-
-    // Factor for alpha ramp near the edges
-    // (makes color less intense at near-UV or near-IR boundaries)
-    let factor = 1.0;
-
-    if (wavelength < 380 || wavelength > 700) {
-      // Invisible or out-of-range
-      return [0, 0, 0];
-    }
-
-    // Below is a simplified approximation of visible range
-
-    if (wavelength >= 380 && wavelength < 440) {
-      R = -(wavelength - 440) / (440 - 380);
-      G = 0.0;
-      B = 1.0;
-    } else if (wavelength >= 440 && wavelength < 490) {
-      R = 0.0;
-      G = (wavelength - 440) / (490 - 440);
-      B = 1.0;
-    } else if (wavelength >= 490 && wavelength < 510) {
-      R = 0.0;
-      G = 1.0;
-      B = -(wavelength - 510) / (510 - 490);
-    } else if (wavelength >= 510 && wavelength < 580) {
-      R = (wavelength - 510) / (580 - 510);
-      G = 1.0;
-      B = 0.0;
-    } else if (wavelength >= 580 && wavelength < 645) {
-      R = 1.0;
-      G = -(wavelength - 645) / (645 - 580);
-      B = 0.0;
-    } else {
-      // 645–700
-      R = 1.0;
-      G = 0.0;
-      B = 0.0;
-    }
-
-    // Intensity factor for the edges
-    if (wavelength < 420) {
-      // ramp up from 380 to 420
-      factor = 0.3 + 0.7 * (wavelength - 380) / (40);
-    } else if (wavelength > 700 - 80) {
-      // ramp down from 620 to 700
-      factor = 0.3 + 0.7 * (700 - wavelength) / 80;
-    }
-
-    // Apply factor + gamma
-    const gamma = 0.8;
-    const R8 = Math.round(255 * Math.pow(R * factor, gamma));
-    const G8 = Math.round(255 * Math.pow(G * factor, gamma));
-    const B8 = Math.round(255 * Math.pow(B * factor, gamma));
-
-    return [
-      Math.max(R8, 0),
-      Math.max(G8, 0),
-      Math.max(B8, 0)
-    ];
-  }
-
-  function generateColorMapOLD() {
-    if (!canvasRef.current) return;
-    const canvas = canvasRef.current;
-    const ctx = canvas.getContext("2d");
-    const totalFrames = audioData.length;
-    const pixelsPerSide = Math.ceil(Math.sqrt(totalFrames));
-
-    // Fill black
-    ctx.fillStyle = "black";
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-    const pixelSize = canvas.width / pixelsPerSide;
-    ctx.filter = "blur(2px)";
-
-    audioData.forEach((frame, index) => {
-      const x = (index % pixelsPerSide) * pixelSize;
-      const y = Math.floor(index / pixelsPerSide) * pixelSize;
-      const avgFrequency =
-        frame.reduce((sum, value) => sum + value, 0) / frame.length;
-      const maxVolume = Math.max(...frame);
-      const brightness = Math.floor((avgFrequency / 255) * 255);
-      const alpha = maxVolume / 255;
-
-      ctx.fillStyle = `rgba(${brightness},${brightness},${brightness},${alpha})`;
-      ctx.fillRect(x, y, pixelSize, pixelSize);
-    });
-
-    ctx.filter = "none";
-    ctx.font = "12px monospace";
-    ctx.fillStyle = "rgba(255, 255, 255, 0.5)";
-    ctx.fillText(`#${currentIdentifier}`, canvas.width - 70, canvas.height - 10);
-  }
-
-  // async function stopRecording() {
-  //   // Optionally enforce minimum 3s
-  //   if (Date.now() - startTimeRef.current < 3000) {
-  //     return;
-  //   }
-
-  //   setIsRecording(false);
-  //   clearInterval(timerIntervalRef.current);
-
-  //   clearInterval(captureIntervalRef.current);
-  //   captureIntervalRef.current = null;
-
-  //   if (
-  //     mediaRecorderRef.current &&
-  //     mediaRecorderRef.current.state !== "inactive"
-  //   ) {
-  //     mediaRecorderRef.current.stop();
-  //     await new Promise((resolve) => {
-  //       mediaRecorderRef.current.onstop = () => {
-  //         const audioBlob = new Blob(recordedChunks, { type: "audio/webm" });
-  //         // store the audio blob in a Map
-  //         audioStorageRef.current.set(currentIdentifier, audioBlob);
-  //         resolve();
-  //       };
-  //     });
-  //   }
-
-  //   // Stop the audio tracks so the mic is actually released
-  //   if (streamRef.current) {
-  //     streamRef.current.getTracks().forEach((track) => track.stop());
-  //     streamRef.current = null; // clear out
-  //   }
-
-  //   if (audioContextRef.current) {
-  //     audioContextRef.current.close();
-  //   }
-  //   generateColorMap();
-  // }
-
   async function stopRecording() {
     if (!isRecording) return;
-
-    // Enforce minimum 3s recording time
+    // Optionally enforce minimum 3s
     if (Date.now() - startTimeRef.current < 3000) {
-        return;
+      return;
     }
 
     setIsRecording(false);
     clearInterval(timerIntervalRef.current);
 
-    // Stop the processor and audio context
-    if (audioProcessorRef.current) {
-        audioProcessorRef.current.disconnect();
-        audioProcessorRef.current = null;
+    clearInterval(captureIntervalRef.current);
+    captureIntervalRef.current = null;
+
+    if (
+      mediaRecorderRef.current &&
+      mediaRecorderRef.current.state !== "inactive"
+    ) {
+      mediaRecorderRef.current.stop();
+      await new Promise((resolve) => {
+        mediaRecorderRef.current.onstop = async () => {
+          const webmBlob = new Blob(recordedChunks, { type: 'audio/webm' });
+          // Convert to MP3
+          const mp3Blob = await convertWebMToMP3(webmBlob);
+          // Store the MP3 in our Map
+          audioStorageRef.current.set(currentIdentifier, mp3Blob);
+          resolve();
+        };
+      });
+    }
+
+    // Stop the audio tracks so the mic is actually released
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((track) => track.stop());
+      streamRef.current = null; // clear out
     }
 
     if (audioContextRef.current) {
-        audioContextRef.current.close();
-        audioContextRef.current = null;
+      audioContextRef.current.close();
     }
-
-    // Stop the microphone stream
-    if (streamRef.current) {
-        streamRef.current.getTracks().forEach(track => track.stop());
-        streamRef.current = null;
-    }
-
-    // Convert raw PCM data to Blob (optional)
-    const pcmBlob = new Blob([new Float32Array(audioDataRef.current)], { type: 'audio/wav' });
-    audioStorageRef.current.set(currentIdentifier, pcmBlob);
-
-    generateColorMap(); // Assuming this is used elsewhere in your app
-}
-
-// // Create "Start Recording" button
-// const startButton = document.createElement('button');
-// startButton.id = 'Start Recording';  // Set the ID for the button
-// startButton.textContent = 'Start Recording';  // Set the text of the button
-
-// // Create "Stop Recording" button
-// const stopButton = document.createElement('button');
-// stopButton.id = 'Stop Recording';  // Set the ID for the button
-// stopButton.textContent = 'Stop Recording';  // Set the text of the button
-
-// // Append buttons to the body or a specific container element
-// document.body.appendChild(startButton);
-// document.body.appendChild(stopButton);
-
-// // Add event listeners to the buttons
-// startButton.addEventListener('click', startRecording);
-// stopButton.addEventListener('click', stopRecording);
-
-// // Event listeners for buttons
-// document.getElementById("Start Recording").addEventListener("click", startRecording);
-// document.getElementById("Stop Recording").addEventListener("click", stopRecording);
-
-  function downloadImage() {
-    if (!canvasRef.current) return;
-    const link = document.createElement("a");
-    link.download = `voice-color-map-${currentIdentifier}.png`;
-    link.href = canvasRef.current.toDataURL("image/png");
-    link.click();
+    generateColorMap();
+    await uploadAudioAndImageToFirebase();
   }
 
-  async function downloadRecordingAsMp3() {
-    // 1) Bail if no current ID or Blob
-    if (!currentIdentifier) return;
-    const webmBlob = audioStorageRef.current.get(currentIdentifier);
-    if (!webmBlob) {
-      alert("No recording available to download.");
-      return;
+  function stopHighQualityRecording() {
+    // 1) Hide the “Stop” button right away:
+    setIsHQRecording(false);
+
+    // 2) Show spinner or logo
+    setIsProcessingHQ(true);
+
+    // 3) Force a small delay so React can paint
+    requestAnimationFrame(() => {
+      // 4) Another slight delay
+      setTimeout(() => {
+        // Now do the mic teardown
+        teardownHQMicAndProcess();
+      }, 0);
+    });
+  }
+
+  function dataURLToBlob(dataURL) {
+    const arr = dataURL.split(',');
+    const mime = arr[0].match(/:(.*?);/)[1];
+    const bstr = atob(arr[1]);
+    let n = bstr.length;
+    const u8arr = new Uint8Array(n);
+    while (n--) {
+      u8arr[n] = bstr.charCodeAt(n);
     }
+    return new Blob([u8arr], { type: mime });
+  }
+
+  async function uploadAudioAndImageToFirebase(idOverride) {
+    const id = idOverride || currentIdentifier;
 
     try {
-      // 2) Convert WebM -> MP3 (using a separate helper function)
-      const mp3Blob = await convertWebMToMP3(webmBlob);
+      const audioBlob = audioStorageRef.current.get(id);
+      if (!audioBlob) {
+        console.warn("No audio found for id:", id);
+        return;
+      }
 
-      // 3) Create a temporary URL and trigger a download
-      const url = URL.createObjectURL(mp3Blob);
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = `recording-${currentIdentifier}.mp3`;
-      link.click();
+      const lookupToken = generateLookupToken();
+      const publicPlayUrl = buildPublicPlayUrl(lookupToken);
+      const qrCodeImageUrl = `https://api.qrserver.com/v1/create-qr-code/?size=512x512&data=${encodeURIComponent(publicPlayUrl)}`;
 
-      URL.revokeObjectURL(url);
+      // ✅ use id everywhere
+      const audioRef = ref(storage, `audio/${id}.mp3`);
+      await uploadBytes(audioRef, audioBlob);
+
+      const canvas = canvasRef.current;
+      const dataUrl = canvas.toDataURL("image/png");
+      const imageBlob = dataURLToBlob(dataUrl);
+      const imageRef = ref(storage, `images/${id}.png`);
+      await uploadBytes(imageRef, imageBlob);
+
+      await setDoc(doc(db, "recordings", id), {
+        userId: auth.currentUser.uid,
+        recordingId: id,
+        audioPath: `audio/${id}.mp3`,
+        imagePath: `images/${id}.png`,
+        qrToken: lookupToken,
+        playUrl: publicPlayUrl,
+        qrCodeUrl: qrCodeImageUrl,
+        createdAt: new Date()
+      });
+
+      console.log("Audio, image, and QR metadata stored in Firebase:", id);
+
     } catch (err) {
-      console.error("Transcoding failed:", err);
-      alert("Error transcoding the recording to MP3.");
+      console.error("Error uploading to Firebase:", err);
     }
+  }
+
+  async function teardownHQMicAndProcess() {
+    // 1 Stop mic
+    if (hqStreamRef.current) {
+      hqStreamRef.current.getTracks().forEach(track => track.stop());
+      hqStreamRef.current = null;
+    }
+
+    // 2 Disconnect
+    if (recorderNodeRef.current) {
+      recorderNodeRef.current.disconnect();
+      recorderNodeRef.current = null;
+    }
+    if (hqAudioContextRef.current) {
+      hqAudioContextRef.current.close();
+      hqAudioContextRef.current = null;
+    }
+
+    // 3) Stop the MediaRecorder & wait for onstop
+    if (hqMediaRecorderRef.current && hqMediaRecorderRef.current.state !== 'inactive') {
+      await new Promise((resolve) => {
+        hqMediaRecorderRef.current.onstop = () => {
+          // Build the final WebM blob
+          const webmBlob = new Blob(hqRecordedChunksRef.current, { type: 'audio/webm' });
+          // Store in our audioStorageRef for uploading
+          audioStorageRef.current.set(currentIdentifier, webmBlob);
+
+          resolve();
+        };
+        hqMediaRecorderRef.current.stop();
+      });
+    }
+
+    // Convert raw data
+    const floatArray = new Float32Array(highQualityDataRef.current);
+
+    // Now do your heavy offline FFT
+    generateHQColorMap(floatArray);
+
+    // 5) Optionally upload automatically
+    await uploadAudioAndImageToFirebase();
+
+    // Done: hide spinner
+    setIsProcessingHQ(false);
+  }
+
+  function generateHQColorMap(floatArray) {
+    const totalSamples = floatArray.length;
+    let allFrequencyFrames = [];
+
+    for (let start = 0; start < totalSamples; start += HOP_SIZE) {
+      const end = start + FFT_SIZE;
+      // If we go beyond totalSamples, zero-pad
+      if (end > totalSamples) {
+        const padded = new Float32Array(FFT_SIZE);
+        padded.set(floatArray.subarray(start, totalSamples), 0);
+        allFrequencyFrames.push(computeFFTMagnitudes(padded));
+        break;
+      } else {
+        const slice = floatArray.subarray(start, end);
+        allFrequencyFrames.push(computeFFTMagnitudes(slice));
+      }
+    }
+
+    // normalize frames to [0..255] etc.
+    const normalized = normalizeFFTFrames(allFrequencyFrames);
+
+    // store in state, generate color map
+    setAudioData(normalized);
+    generateColorMap(); // or trigger the same method you use for final image
+    // Done generating frames -> hide spinner
+    setIsProcessingHQ(false);
+  }
+
+  function arrayMax(arr) {
+    let max = -Infinity;
+    for (let i = 0; i < arr.length; i++) {
+      const val = arr[i];
+      if (val > max) max = val;
+    }
+    return max;
+  }
+
+  function normalizeFFTFrames(frames) {
+    if (!frames.length) return [];
+
+    // 1️⃣ Convert magnitudes → log scale (perceptual compression)
+    const logFrames = frames.map(frame =>
+      frame.map(v => Math.log1p(v)) // log compression
+    );
+
+    // 2️⃣ Find global max AFTER log compression
+    const merged = logFrames.flatMap(frame => Array.from(frame));
+    const globalMax = arrayMax(merged) || 1;
+
+    // 3️⃣ Normalize using GLOBAL max (not per-frame)
+    //    This preserves real amplitude differences across time
+    const normalized = logFrames.map(frame =>
+      frame.map(v => (v / globalMax) * 255)
+    );
+
+    return normalized;
   }
 
   async function convertWebMToMP3(webmBlob) {
@@ -801,25 +994,6 @@ function App() {
     return mp3Blob;
   }
 
-  // OLD WEBM version
-  function downloadRecording() {
-    if (!currentIdentifier) return;
-    const storedBlob = audioStorageRef.current.get(currentIdentifier);
-    if (!storedBlob) {
-      alert("No recording available to download.");
-      return;
-    }
-    // Create a URL for the Blob and click on a hidden link
-    const url = URL.createObjectURL(storedBlob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `recording-${currentIdentifier}.webm`; // Or .mp3, etc., if re-encoded
-    link.click();
-    // Cleanup
-    URL.revokeObjectURL(url);
-  }
-
-
   async function handleFileUploadOfflineAnalysis(event) {
     const file = event.target.files?.[0];
     if (!file) return;
@@ -837,8 +1011,16 @@ function App() {
     const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
 
+    // Use the ORIGINAL file, not audioBuffer
+    let finalBlob = file;
+
+    // Normalize only if needed
+    if (file.type !== "audio/mpeg" && file.type !== "audio/mp3") {
+      finalBlob = await convertWebMToMP3(file);
+    }
+
     // Save the file or Blob in the Map if you want to keep it for playback
-    audioStorageRef.current.set(newId, file);
+    audioStorageRef.current.set(newId, finalBlob);
 
     // 3) We'll do an offline "instant" FFT on each chunk
     //    For simplicity, we only handle channel 0
@@ -898,6 +1080,9 @@ function App() {
     setAudioData(normalizedFrames);
     generateColorMap();
 
+    // Upload using explicit ID (you must update this function)
+    await uploadAudioAndImageToFirebase(newId);
+
     // Cleanup
     audioCtx.close();
   }
@@ -933,15 +1118,29 @@ function App() {
     return magnitudes;
   }
 
+  // Keep a single audio instance so it doesn't stack
+  const audioPlayerRef = useRef(null);
+
   function playStoredAudio() {
     if (!currentIdentifier) return;
+
     const storedBlob = audioStorageRef.current.get(currentIdentifier);
     if (!storedBlob) {
       alert("No audio available for this color map");
       return;
     }
+
+    // Stop any currently playing audio
+    if (audioPlayerRef.current) {
+      audioPlayerRef.current.pause();
+      audioPlayerRef.current.currentTime = 0;
+    }
+
     const audioUrl = URL.createObjectURL(storedBlob);
     const audio = new Audio(audioUrl);
+
+    audioPlayerRef.current = audio;
+
     audio.play();
   }
 
@@ -951,7 +1150,7 @@ function App() {
       <span>Upload Audio (Offline Analysis)</span>
       <input
         type="file"
-        accept="audio/*"
+        accept="audio/*, audio/wav, audio/mpeg, audio/mp3, audio/ogg, audio/webm"
         onChange={handleFileUploadOfflineAnalysis}
         className="hidden"
       />
@@ -962,9 +1161,17 @@ function App() {
     <div className="bg-gray-900 min-h-screen">
       <div className="container mx-auto px-4 py-8">
         <div className="max-w-2xl mx-auto">
-          <h1 className="text-3xl font-bold text-white mb-8 text-center">
-            Voice to Color Translator
-          </h1>
+          <div className="flex justify-between items-center mb-8">
+            <h1 className="text-3xl font-bold text-white">
+              Tunetoon
+            </h1>
+            <button
+              onClick={handleLogout}
+              className="px-4 py-2 bg-red-500 hover:bg-red-600 text-white rounded-lg"
+            >
+              Logout
+            </button>
+          </div>
 
           {/* Card-like container */}
           <div className="bg-gray-800 p-6 rounded-lg shadow-xl">
@@ -974,7 +1181,6 @@ function App() {
                   ref={canvasRef}
                   className="w-full aspect-square rounded-lg gradient-canvas bg-black dropzone"
                 />
-
                 {/* Timer overlay */}
                 {isRecording && (
                   <div className="absolute top-4 right-4 text-white text-xl font-mono bg-black/50 px-3 py-1 rounded-lg">
@@ -983,15 +1189,29 @@ function App() {
                 )}
 
                 {/* Identifier overlay (after recording) */}
+                {/*}
                 {!isRecording && currentIdentifier && (
                   <div className="absolute bottom-4 right-4 text-white text-sm font-mono bg-black/50 px-2 py-1 rounded-lg">
                     #{currentIdentifier}
                   </div>
                 )}
+                  */}
               </div>
 
+              {/* Centered spinner overlay (if isProcessingHQ is true) */}
+              {isProcessingHQ && (
+                <div className="absolute inset-0 flex items-center justify-center bg-black/50 z-10">
+                  {/* Simple spinner icon or text */}
+                  <div className="flex flex-col items-center">
+                    {/* A Tailwind "spinner" can be done like this: */}
+                    <div className="h-12 w-12 border-4 border-purple-500 border-t-transparent rounded-full animate-spin mb-4" />
+                    <span className="text-white">Processing HQ Audio...</span>
+                  </div>
+                </div>
+              )}
+
               <div className="flex flex-wrap gap-4 justify-center">
-                {!isRecording && (
+                {!isRecording && !isHQRecording && (
                   <div className="flex gap-4">
                     <button
                       onClick={startRecording}
@@ -1000,11 +1220,17 @@ function App() {
                       <i className="bi bi-mic-fill" />
                       <span>Start Recording</span>
                     </button>
-          
-
-
                     {uploadButton}
                   </div>
+                )}
+
+                {!isHQRecording && !isRecording && (
+                  <button
+                    onClick={startHighQualityRecording}
+                    className="px-6 py-3 bg-indigo-500 text-white rounded-lg"
+                  >
+                    Start HQ Recording
+                  </button>
                 )}
 
                 {isRecording && (
@@ -1017,15 +1243,30 @@ function App() {
                   </button>
                 )}
 
-                {!isRecording && currentIdentifier && (
+                {isHQRecording && (
+                  <button
+                    onClick={stopHighQualityRecording}
+                    className="px-6 py-3 bg-red-500 text-white rounded-lg"
+                  >
+                    Stop HQ Recording
+                  </button>
+                )}
+
+                {!isRecording && !isHQRecording && currentIdentifier && (
                   <>
-                    <button
-                      onClick={downloadImage}
-                      className="px-6 py-3 bg-blue-500 hover:bg-blue-600 text-white rounded-lg flex items-center gap-2 transition-colors"
-                    >
-                      <i className="bi bi-download" />
-                      <span>Download Image</span>
-                    </button>
+                    {/* 
+                    At some point in your UI, once the user has recorded 
+                    (or you have a valid 'currentIdentifier'), we render MyRecordingActions.
+                    */}
+                    {!purchased && (
+                      <>
+                        <DownloadTuneToonButton
+                          recordingId={currentIdentifier}
+                          canDownload={!!(recordingDoc?.audioPath && recordingDoc?.imagePath)}
+                        />
+                        {/* <PurchaseTuneToonButton recordingId={currentIdentifier} /> */}
+                      </>
+                    )}
                     <button
                       onClick={playStoredAudio}
                       className="px-6 py-3 bg-purple-500 hover:bg-purple-600 text-white rounded-lg flex items-center gap-2 transition-colors"
@@ -1033,42 +1274,53 @@ function App() {
                       <i className="bi bi-play-fill" />
                       <span>Play Original Audio</span>
                     </button>
-                    {/* NEW DOWNLOAD RECORDING BUTTON */}
-                    <button
-                      onClick={downloadRecordingAsMp3}
-                      className="px-6 py-3 bg-yellow-500 hover:bg-yellow-600 text-white rounded-lg flex items-center gap-2 transition-colors"
-                    >
-                      <i className="bi bi-cloud-download-fill" />
-                      <span>Download Recording</span>
-                    </button>
+                    {playUrl && (
+                      <a
+                        href={playUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="px-6 py-3 bg-slate-600 hover:bg-slate-700 text-white rounded-lg flex items-center gap-2 transition-colors"
+                      >
+                        <span>Open Public Audio Page</span>
+                      </a>
+                    )}
                   </>
+                )}
+                {/* QR display section */}
+                {!isRecording && !isHQRecording && currentIdentifier && qrCodeUrl && (
+                  <div className="w-full flex flex-col items-center gap-3">
+                    <p className="text-sm text-gray-300 text-center max-w-lg">
+                      QR code for this Tunetoon. Scanning it opens the original audio playback page.
+                    </p>
+                    <img
+                      src={qrCodeUrl}
+                      alt="QR code for Tunetoon audio playback"
+                      className="w-48 h-48 rounded-lg bg-white p-2"
+                    />
+                    {qrToken && (
+                      <p className="text-xs text-gray-400 break-all text-center max-w-lg">
+                        Lookup token: {qrToken}
+                      </p>
+                    )}
+                    {playUrl && (
+                      <a
+                        href={playUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-xs text-blue-400 underline break-all text-center max-w-lg hover:text-blue-300"
+                      >
+                        {playUrl}
+                      </a>
+                    )}
+                  </div>
                 )}
               </div>
 
-              {/* Now a new flex row to hold text & dropdown side by side */}
-              <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between w-full gap-4">
-                <div className="text-gray-300 text-center space-y-2">
-                  <p>High frequencies = Lighter colors</p>
-                  <p>Low frequencies = Darker colors</p>
-                  <p>Silence = Black</p>
-                  <p>Volume controls color intensity</p>
-                  <p className="text-sm text-gray-400 mt-4">
-                    Minimum recording time: 3 seconds
-                  </p>
-                  <p className="text-sm text-gray-400">
-                    Drag &amp; drop a previous color map to play its original
-                    audio
-                  </p>
-                </div>
-
-                {/* A row with two dropdowns */}
-                <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between w-full gap-4">
-                  <div className="text-gray-300 text-center space-y-2">
-                    {/* Info text */}
-                  </div>
-
-                  <div className="flex flex-col gap-2">
-                    <p className="font-semibold">Select a Blend Mode</p>
+              {/* Customizable feature controls - centered layout */}
+              <div className="w-full flex justify-center">
+                <div className="flex flex-col items-center gap-4">
+                  <div className="flex flex-col gap-2 items-center">
+                    <p className="font-semibold text-gray-200">Select a Blend Mode</p>
                     <select
                       value={blendMode}
                       onChange={(e) => setBlendMode(e.target.value)}
@@ -1081,8 +1333,7 @@ function App() {
                       <option value="additive">Additive Composite</option>
                     </select>
 
-                    {/* Second dropdown for overlap */}
-                    <p className="mt-4 font-semibold">Shape Overlap</p>
+                    <p className="mt-4 font-semibold text-gray-200">Shape Overlap</p>
                     <select
                       value={shapeMultiplier}
                       onChange={(e) => setShapeMultiplier(e.target.value)}
@@ -1092,8 +1343,8 @@ function App() {
                       <option value="1.5">Medium (1.5)</option>
                       <option value="2.0">Heavy (2.0)</option>
                     </select>
-                    {/* Color spectrum invert */}
-                    <p className="mt-4 font-semibold">Color Spectrum</p>
+
+                    <p className="mt-4 font-semibold text-gray-200">Color Spectrum</p>
                     <select
                       value={colorSpectrum}
                       onChange={(e) => setColorSpectrum(e.target.value)}
@@ -1102,11 +1353,254 @@ function App() {
                       <option value="normal">Normal</option>
                       <option value="inverted">Inverted</option>
                     </select>
+
+                    <p className="mt-4 font-semibold text-gray-200">Frequency Range</p>
+                    <select
+                      value={frequencyRangeMode}
+                      onChange={(e) => setFrequencyRangeMode(e.target.value)}
+                      className="px-2 py-1 rounded"
+                    >
+                      <option value="voice">Voice (80–6kHz)</option>
+                      <option value="music">Music (20–12kHz)</option>
+                      <option value="adaptive">Adaptive</option>
+                    </select>
+
+                    <p className="mt-4 font-semibold text-gray-200">Pixel Mosaic Mode</p>
+                    <select
+                      value={pixelMosaicMode ? "on" : "off"}
+                      onChange={(e) => setPixelMosaicMode(e.target.value === "on")}
+                      className="px-2 py-1 rounded"
+                    >
+                      <option value="off">Off</option>
+                      <option value="on">On</option>
+                    </select>
+
+                    <p className="mt-4 font-semibold text-gray-200">Stained Glass Mode</p>
+                    <select
+                      value={stainedGlassMode ? "on" : "off"}
+                      onChange={(e) => setStainedGlassMode(e.target.value === "on")}
+                      className="px-2 py-1 rounded"
+                    >
+                      <option value="off">Off</option>
+                      <option value="on">On</option>
+                    </select>
                   </div>
                 </div>
               </div>
             </div>
           </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DownloadTuneToonButton({ recordingId, canDownload }) {
+  const [isLoading, setIsLoading] = useState(false);
+
+  const handleDownload = async () => {
+    if (!recordingId) return;
+
+    try {
+      setIsLoading(true);
+
+      const url = `https://us-central1-tunetoon-d77f5.cloudfunctions.net/downloadTunetoon?recordingId=${recordingId}`;
+
+      // Debug logging for auth
+      const token = await auth.currentUser?.getIdToken();
+
+      if (!token) {
+        throw new Error("No auth token available");
+      }
+
+      const res = await fetch(url, {
+        headers: {
+          Authorization: `Bearer ${token}`
+        }
+      });
+
+      if (!res.ok) {
+        const text = await res.text();
+        console.error("Download error response:", text);
+        throw new Error(text || "Download failed");
+      }
+
+      const blob = await res.blob();
+      const downloadUrl = window.URL.createObjectURL(blob);
+
+      const a = document.createElement("a");
+      a.href = downloadUrl;
+      a.download = `tunetoon-${recordingId}.zip`;
+      a.click();
+
+    } catch (err) {
+      console.error(err);
+      alert("Download failed");
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  return (
+    <button
+      onClick={handleDownload}
+      disabled={isLoading || !canDownload}
+      className={`px-6 py-3 rounded-lg flex items-center gap-2 transition-colors ${(isLoading || !canDownload)
+        ? "bg-gray-500 cursor-not-allowed"
+        : "bg-blue-500 hover:bg-blue-600 text-white"
+        }`}
+    >
+      {!canDownload ? (
+        <>
+          <div className="h-4 w-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+          <span>Uploading...</span>
+        </>
+      ) : isLoading ? (
+        <>
+          <div className="h-4 w-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+          <span>Preparing Download...</span>
+        </>
+      ) : (
+        <span>Download Tunetoon</span>
+      )}
+    </button>
+  );
+}
+
+// function PurchaseTuneToonButton({ recordingId }) {
+//   const handlePurchase = async () => {
+//     // Set purchased to true in Firestore to trigger the unlimited QR generation
+//     await setDoc(doc(db, 'recordings', recordingId), {
+//       purchased: true
+//     }, { merge: true });
+//   };
+
+//   return (
+//     <button
+//       onClick={handlePurchase}
+//       className="px-6 py-3 bg-indigo-500 hover:bg-indigo-600 text-white rounded-lg flex items-center gap-2 transition-colors"
+//     >
+//       Purchase TuneToon
+//     </button>
+//   );
+// }
+
+function PlayPage() {
+  const location = useLocation();
+  const queryParams = new URLSearchParams(location.search);
+  const recordingId = queryParams.get('recording');
+  const qrToken = queryParams.get('token');
+
+  const [recordingData, setRecordingData] = useState(null);
+  const [error, setError] = useState('');
+  const audioRef = useRef(null);
+
+  useEffect(() => {
+    if (!recordingId && !qrToken) {
+      setError('No recording specified.');
+      return;
+    }
+
+    async function fetchRecording() {
+      try {
+        let data = null;
+
+        if (recordingId) {
+          // Keep direct lookup for internal (authenticated) use
+          const docRef = doc(db, 'recordings', recordingId);
+          const docSnap = await getDoc(docRef);
+          if (docSnap.exists()) data = docSnap.data();
+        } else if (qrToken) {
+          // Use Cloud Function for public QR access
+          const res = await fetch(
+            `https://us-central1-tunetoon-d77f5.cloudfunctions.net/getRecordingByToken?token=${encodeURIComponent(qrToken)}`
+          );
+
+          if (!res.ok) {
+            setError('Recording not found.');
+            return;
+          }
+
+          data = await res.json();
+        }
+
+        if (!data) {
+          setError('Recording not found.');
+          return;
+        }
+
+        setRecordingData(data);
+      } catch (err) {
+        console.error(err);
+        setError('Error loading recording.');
+      }
+    }
+
+    fetchRecording();
+  }, [recordingId, qrToken]);
+
+  useEffect(() => {
+    if (recordingData?.audioUrl && audioRef.current) {
+      audioRef.current.play().catch((err) => {
+        console.group("🎵 Autoplay failed");
+        console.error(err);
+        console.log("name:", err.name);
+        console.log("message:", err.message);
+        console.log("code:", err.code);
+        console.log("userAgent:", navigator.userAgent);
+        console.log("platform:", navigator.platform);
+        console.log("vendor:", navigator.vendor);
+        console.groupEnd();
+      });
+    }
+  }, [recordingData]);
+
+  if (error) {
+    return <div className="p-4 text-red-500">Error: {error}</div>;
+  }
+
+  if (!recordingData) {
+    return <div className="p-4 text-white">Loading...</div>;
+  }
+
+  return (
+    <div className="min-h-screen bg-gray-900 text-white px-4 py-8">
+      <div className="max-w-2xl mx-auto bg-gray-800 rounded-lg shadow-xl p-6">
+        <div className="flex items-center justify-center mb-6">
+          <h1 className="text-2xl font-bold">Playing Tunetoon</h1>
+        </div>
+
+        {recordingData.imageUrl ? (
+          <img src={recordingData.imageUrl} className="mb-6 rounded-lg shadow-lg max-w-full" />
+        ) : (
+          <p className="text-gray-300 mb-6">No image available.</p>
+        )}
+
+        {recordingData.audioUrl ? (
+          <audio
+            ref={audioRef}
+            controls
+            autoPlay
+            src={recordingData.audioUrl}
+            className="w-full"
+          />
+        ) : (
+          <p className="text-gray-300">No audio available.</p>
+        )}
+        {recordingData.scanCount !== undefined && (
+          <p className="text-sm text-gray-400 mt-4 text-center">
+            Played {recordingData.scanCount} times
+          </p>
+        )}
+        <div className="mt-8 text-center">
+          <a
+            href="https://www.elohimslens.com/tunetoon"
+            target="_blank"
+            rel="noreferrer"
+            className="text-lg font-semibold text-blue-400 hover:text-blue-300 underline"
+          >
+            Order Yours Today!
+          </a>
         </div>
       </div>
     </div>
